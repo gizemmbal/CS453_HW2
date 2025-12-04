@@ -1,45 +1,34 @@
 import requests
 import csv
 import google.generativeai as genai
-import config  # default keys and settings
 
 MODEL_NAME = "gemini-2.5-flash"
 
 
 def parse_repo(url: str):
-    """Extract (owner, repo) from a GitHub URL."""
-    parts = url.strip().split("/")
+    parts = url.strip().rstrip("/").split("/")
+    if len(parts) < 2:
+        raise ValueError("Invalid GitHub repo URL.")
     return parts[-2], parts[-1]
 
 
 def get_pr_diff(owner: str, repo: str, pr_number: int, github_token: str) -> str:
-    """
-    Fetch PR diff text from GitHub.
-    Return diff text or empty string if unavailable.
-    """
     url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
     headers = {
         "Authorization": f"token {github_token}",
-        "Accept": "application/vnd.github.v3.diff"
+        "Accept": "application/vnd.github.v3.diff",
     }
-
     r = requests.get(url, headers=headers)
     if r.status_code == 200:
         return r.text
-
-    print(f"⚠️ Diff for PR #{pr_number} unavailable.")
+    print(f"PR #{pr_number} diff could not be retrieved. Status: {r.status_code}")
     return ""
 
 
 def ask_gemini(diff_text: str):
-    """
-    Send diff to Gemini, return generated (title, summary).
-    If request fails → return empty strings.
-    """
     if not diff_text:
         return "", ""
 
-    # Optional safety crop for very large diffs
     if len(diff_text) > 8000:
         diff_text = diff_text[:8000]
 
@@ -79,33 +68,43 @@ DIFF:
         return title, summary
 
     except Exception as e:
-        print("⚠️ Gemini API error:", e)
+        print("Gemini API error:", e)
         return "", ""
 
 
 def main():
-    repo_url = config.GITHUB_REPO_URL
-    github_token = config.GITHUB_TOKEN
-    gemini_key = config.GEMINI_API_KEY
-    n_prs = config.N_PRS
+    repo_url = input("GitHub Repo URL: ").strip()
+    github_token = input("GitHub Token: ").strip()
+    gemini_key = input("Gemini API Key: ").strip()
+    n_prs_str = input("Number of PRs to summarize: ").strip()
 
-    if not repo_url or not github_token or not gemini_key:
-        print("❌ Missing keys or repo URL in config.py")
+    try:
+        n_prs = int(n_prs_str)
+        if n_prs <= 0:
+            print("PR count must be a positive integer.")
+            return
+    except ValueError:
+        print("Invalid PR count.")
         return
 
-    # Setup Gemini API
+    if not repo_url or not github_token or not gemini_key:
+        print("Missing required inputs.")
+        return
+
     genai.configure(api_key=gemini_key)
 
-    owner, repo = parse_repo(repo_url)
+    try:
+        owner, repo = parse_repo(repo_url)
+    except ValueError as e:
+        print(e)
+        return
 
-    # ------------------------------------------------------------------
-    # 2) LAST N MERGED PRs: sayfa sayfa gezerek gerçekten N merged PR topluyoruz
-    # ------------------------------------------------------------------
     merged_prs = []
     page = 1
-    per_page = 100  # GitHub maksimum
+    per_page = 100
+    base_url = f"https://api.github.com/repos/{owner}/{repo}/pulls"
 
-    print(f"Fetching last {n_prs} merged PRs from: https://api.github.com/repos/{owner}/{repo}/pulls")
+    print(f"Fetching last {n_prs} merged PRs from {base_url}...")
 
     while len(merged_prs) < n_prs:
         params = {
@@ -115,30 +114,22 @@ def main():
             "per_page": per_page,
             "page": page,
         }
-
         headers = {
             "Authorization": f"token {github_token}",
             "Accept": "application/vnd.github+json",
         }
 
-        r = requests.get(
-            f"https://api.github.com/repos/{owner}/{repo}/pulls",
-            headers=headers,
-            params=params,
-        )
-
+        r = requests.get(base_url, headers=headers, params=params)
         if r.status_code != 200:
-            print("❌ GitHub API failed. Status:", r.status_code)
+            print("GitHub API error:", r.status_code)
             print(r.text)
-            break
+            return
 
         data = r.json()
         if not isinstance(data, list) or not data:
-            # Daha fazla PR yok
             break
 
         for pr in data:
-            # Sadece merged PR'ları al
             if pr.get("merged_at"):
                 merged_prs.append(pr)
                 if len(merged_prs) == n_prs:
@@ -146,28 +137,31 @@ def main():
 
         page += 1
 
-    print(f"Merged PR count collected: {len(merged_prs)}")
-
     if not merged_prs:
-        print("❌ No merged PRs found.")
+        print("No merged PRs found.")
         return
 
+    if len(merged_prs) < n_prs:
+        print(f"Only {len(merged_prs)} merged PRs found.")
+    else:
+        print(f"{len(merged_prs)} merged PRs collected.")
+
+    print("Generating titles and summaries...")
+
     rows = []
+
     for pr in merged_prs:
         number = pr["number"]
-        original_title = pr["title"] or ""
-        original_summary = pr["body"] or ""
+        original_title = pr.get("title") or ""
+        original_summary = pr.get("body") or ""
 
         diff = get_pr_diff(owner, repo, number, github_token)
 
         print(f"\nProcessing PR #{number}")
-        print(f"Diff size: {len(diff)}")
+        print(f"Diff size: {len(diff)} characters")
 
         gen_title, gen_summary = ask_gemini(diff)
 
-        # ------------------------------------------------------------------
-        # 3) CSV kolon isimleri ödev PDF'indekiyle birebir aynı
-        # ------------------------------------------------------------------
         rows.append({
             "PR #": number,
             "Original PR Title": original_title,
@@ -176,7 +170,6 @@ def main():
             "Generated PR Summary": gen_summary,
         })
 
-    # Write CSV (results.csv)
     fields = [
         "PR #",
         "Original PR Title",
@@ -190,8 +183,7 @@ def main():
         w.writeheader()
         w.writerows(rows)
 
-    print(f"\n✅ Saved {len(rows)} rows to results.csv")
-    print("Done.")
+    print(f"\nSaved {len(rows)} rows to results.csv")
 
 
 if __name__ == "__main__":
